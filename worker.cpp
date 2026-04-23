@@ -6,6 +6,7 @@
 #include <queue>
 #include <unistd.h> // For usleep (pause function)
 #include <hiredis/hiredis.h>
+#include <unordered_map>
 
 using namespace std;
 
@@ -47,8 +48,7 @@ bool load_partition(const string& filename) {
 void run_bsp_bfs(redisContext* redis, int source_vertex) {
     queue<int> current_q;
     queue<int> next_q;
-
-    // Only the worker who "owns" the source vertex initializes it
+    unordered_map<int, int> outgoing_best;
     if (is_local(source_vertex)) {
         distances[source_vertex] = 0;
         current_q.push(source_vertex);
@@ -57,105 +57,138 @@ void run_bsp_bfs(redisContext* redis, int source_vertex) {
 
     int superstep = 0;
 
-    // Main BSP Loop
     while (true) {
-        bool worked_this_step = !current_q.empty();
-
         // -----------------------------------------------------
         // PHASE 1: COMPUTE & COMMUNICATE
         // -----------------------------------------------------
+        int messages_sent = 0;
         while (!current_q.empty()) {
             int curr = current_q.front();
             current_q.pop();
 
             for (int neighbor : adj_list[curr]) {
                 int new_dist = distances[curr] + 1;
-                
                 if (is_local(neighbor)) {
                     if (new_dist < distances[neighbor]) {
                         distances[neighbor] = new_dist;
-                        next_q.push(neighbor); // Push to next level
+                        next_q.push(neighbor);
                     }
-                } else {
-                    // Route to the other cloud
-                    string msg = to_string(neighbor) + ":" + to_string(new_dist);
-                    redisReply* r = (redisReply*)redisCommand(redis, "LPUSH %s %s", other_queue.c_str(), msg.c_str());
-                    if (r) freeReplyObject(r);
-                }
+                } 
+else {
+    if (outgoing_best.find(neighbor) == outgoing_best.end() ||
+        new_dist < outgoing_best[neighbor]) {
+        outgoing_best[neighbor] = new_dist;
+    }
+}
             }
         }
+messages_sent = outgoing_best.size();
+if (!outgoing_best.empty()) {
+    // Build all message strings first and store stably
+    vector<string> msg_strs;
+    msg_strs.reserve(outgoing_best.size());
+    for (auto& pair : outgoing_best) {
+        msg_strs.push_back(to_string(pair.first) + ":" + to_string(pair.second));
+    }
+    
+    // Now build argv from stable strings
+    vector<const char*> argv;
+    vector<size_t> argvlen;
+    argv.push_back("LPUSH");
+    argvlen.push_back(5);
+    argv.push_back(other_queue.c_str());
+    argvlen.push_back(other_queue.size());
+    
+    for (auto& msg : msg_strs) {
+        argv.push_back(msg.c_str());
+        argvlen.push_back(msg.size());
+    }
+    
+    redisReply* r = (redisReply*)redisCommandArgv(redis, argv.size(), argv.data(), argvlen.data());
+    if (r) freeReplyObject(r);
+    outgoing_best.clear();
+}
+        // -----------------------------------------------------
+        // PHASE 2: TELL OTHER WORKER HOW MANY MESSAGES WE SENT
+        // -----------------------------------------------------
+        string signal_key = "signal_" + to_string(superstep) + "_" + to_string(worker_id);
+        redisCommand(redis, "SET %s %d", signal_key.c_str(), messages_sent);
+        redisCommand(redis, "EXPIRE %s 300", signal_key.c_str());
+
+        cout << "[Superstep " << superstep << "] Sent " << messages_sent << " messages. Waiting..." << endl;
 
         // -----------------------------------------------------
-        // PHASE 2: BARRIER SYNCHRONIZATION
+        // PHASE 3: WAIT FOR OTHER WORKER TO FINISH SENDING
         // -----------------------------------------------------
-        string sync_key = "sync_step_" + to_string(superstep);
-        redisReply* sync_r = (redisReply*)redisCommand(redis, "INCR %s", sync_key.c_str());
-        if (sync_r) freeReplyObject(sync_r);
+        int other_id = (worker_id == 1) ? 2 : 1;
+        string other_signal = "signal_" + to_string(superstep) + "_" + to_string(other_id);
 
-        cout << "[Superstep " << superstep << "] Waiting at synchronization barrier..." << endl;
-
-        // Block execution until both workers check in
         while (true) {
-            redisReply* check_r = (redisReply*)redisCommand(redis, "GET %s", sync_key.c_str());
-            if (check_r && check_r->str && atoi(check_r->str) == 2) {
-                freeReplyObject(check_r);
-                break; // Both workers reached the barrier!
+            redisReply* r = (redisReply*)redisCommand(redis, "GET %s", other_signal.c_str());
+            if (r && r->str) {
+                freeReplyObject(r);
+                break;
             }
-            if (check_r) freeReplyObject(check_r);
-            usleep(100000); // Sleep for 100ms to prevent spamming Redis
+            if (r) freeReplyObject(r);
+            usleep(50000); // 50ms
         }
 
         // -----------------------------------------------------
-        // PHASE 3: READ MESSAGES (STATE SYNTHESIS)
+        // PHASE 4: READ ALL INCOMING MESSAGES
         // -----------------------------------------------------
-        bool received_messages = false;
+
+int received = 0;
+
+// FETCH ENTIRE QUEUE IN ONE SHOT - single network call!
+redisReply* all_msgs = (redisReply*)redisCommand(redis,
+    "LRANGE %s 0 -1", my_queue.c_str());
+
+if (all_msgs && all_msgs->type == REDIS_REPLY_ARRAY && all_msgs->elements > 0) {
+    for (size_t i = 0; i < all_msgs->elements; i++) {
+        if (!all_msgs->element[i]->str || all_msgs->element[i]->len == 0) continue;
+        string msg = all_msgs->element[i]->str;
+        if (msg.find(':') == string::npos) continue;
+        int delim = msg.find(':');
+        int node = stoi(msg.substr(0, delim));
+        int dist = stoi(msg.substr(delim + 1));
+        if (dist < distances[node]) {
+            distances[node] = dist;
+            next_q.push(node);
+        }
+        received++;
+    }
+    // Clear entire queue in one shot
+    redisReply* del_r = (redisReply*)redisCommand(redis, "DEL %s", my_queue.c_str());
+    if (del_r) freeReplyObject(del_r);
+}
+if (all_msgs) freeReplyObject(all_msgs);
+        cout << "[Superstep " << superstep << "] Received " << received << " messages." << endl;
+        // -----------------------------------------------------
+        // PHASE 5: TERMINATION CHECK
+        // -----------------------------------------------------
+        // Tell other worker if we are active
+        int active = (!next_q.empty()) ? 1 : 0;
+        string active_key = "active2_" + to_string(superstep) + "_" + to_string(worker_id);
+        redisCommand(redis, "SET %s %d", active_key.c_str(), active);
+        redisCommand(redis, "EXPIRE %s 300", active_key.c_str());
+
+        // Wait for other worker's active status
+        string other_active_key = "active2_" + to_string(superstep) + "_" + to_string(other_id);
         while (true) {
-            // Read incoming edges from the other cloud
-            redisReply* pop_r = (redisReply*)redisCommand(redis, "RPOP %s", my_queue.c_str());
-            if (pop_r && pop_r->str) {
-                received_messages = true;
-                string msg = pop_r->str;
-                
-                // Parse "node:distance"
-                int delim = msg.find(':');
-                int node = stoi(msg.substr(0, delim));
-                int dist = stoi(msg.substr(delim + 1));
-
-                // If this is a new shortest path, accept it and schedule for next round
-                if (dist < distances[node]) {
-                    distances[node] = dist;
-                    next_q.push(node);
+            redisReply* r = (redisReply*)redisCommand(redis, "GET %s", other_active_key.c_str());
+            if (r && r->str) {
+                int other_active = atoi(r->str);
+                freeReplyObject(r);
+                if (active == 0 && other_active == 0) {
+                    cout << "Global BFS Termination reached at Superstep " << superstep << "!" << endl;
+                    return;
                 }
-                freeReplyObject(pop_r);
-            } else {
-                if (pop_r) freeReplyObject(pop_r);
-                break; // Queue is empty
+                break;
             }
+            if (r) freeReplyObject(r);
+            usleep(50000);
         }
 
-        // -----------------------------------------------------
-        // PHASE 4: GLOBAL TERMINATION CHECK
-        // -----------------------------------------------------
-        string active_key = "active_step_" + to_string(superstep);
-        if (worked_this_step || received_messages) {
-            redisReply* act_r = (redisReply*)redisCommand(redis, "INCR %s", active_key.c_str());
-            if (act_r) freeReplyObject(act_r);
-        }
-
-        usleep(50000); // Small buffer to ensure both workers report activity
-
-        redisReply* check_act_r = (redisReply*)redisCommand(redis, "GET %s", active_key.c_str());
-        int active_count = 0;
-        if (check_act_r && check_act_r->str) active_count = atoi(check_act_r->str);
-        if (check_act_r) freeReplyObject(check_act_r);
-
-        // If neither worker did local work AND neither received messages, the graph is fully explored.
-        if (active_count == 0) {
-            cout << "Global BFS Termination reached at Superstep " << superstep << "!" << endl;
-            break; 
-        }
-
-        // Prepare for the next level
         swap(current_q, next_q);
         superstep++;
     }
@@ -181,20 +214,33 @@ int main(int argc, char* argv[]) {
 
     if (!load_partition(argv[2])) return 1;
 
-    redisContext *redis = redisConnect("127.0.0.1", 6379);
+    redisContext *redis = redisConnect("100.98.11.34", 6379);
     if (redis == NULL || redis->err) return 1;
     
     // Clear old state from Redis to ensure a clean run
     if (worker_id == 1) {
-        redisCommand(redis, "FLUSHALL");
-        cout << "Redis state cleared by Master Node." << endl;
-    }
-    
-    usleep(500000); // Wait half a second for Worker 2 to catch up
-    
-    // Start BFS from Source Node 1
-    run_bsp_bfs(redis, 1);
+    redisCommand(redis, "FLUSHALL");
+    cout << "Redis state cleared by Master Node." << endl;
+    usleep(300000); // let Worker 2 notice the flush
+}
 
+// READY BARRIER — both workers meet here before BFS starts
+cout << "Registering as ready..." << endl;
+redisCommand(redis, "INCR ready_count");
+
+while (true) {
+    redisReply* r = (redisReply*)redisCommand(redis, "GET ready_count");
+    if (r && r->str && atoi(r->str) >= 2) {
+        freeReplyObject(r);
+        break;
+    }
+    if (r) freeReplyObject(r);
+    usleep(200000);
+}
+cout << "Both workers ready! Starting BFS..." << endl;
+
+// Start BFS from Source Node 1
+run_bsp_bfs(redis, 1);
     redisFree(redis);
     return 0;
 }
