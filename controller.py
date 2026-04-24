@@ -53,7 +53,7 @@ def main():
     available_bytes = mem_info.available
     
     # Let's reserve 20% of Baadal's RAM for the OS and Redis to be safe
-    safe_baadal_bytes = available_bytes * 0.8
+    safe_baadal_bytes = 8 * 1024 * 1024  # simulate 8MB limit
     
     print(f"Baadal VM Safe Available RAM: {safe_baadal_bytes / (1024*1024):.2f} MB")
     

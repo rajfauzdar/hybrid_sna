@@ -1,7 +1,7 @@
 #include <iostream>
 #include <fstream>
 #include <vector>
-#include <unordered_map>
+#include <map>
 #include <string>
 #include <queue>
 #include <unistd.h> // For usleep (pause function)
@@ -181,7 +181,110 @@ if (all_msgs) freeReplyObject(all_msgs);
                 freeReplyObject(r);
                 if (active == 0 && other_active == 0) {
                     cout << "Global BFS Termination reached at Superstep " << superstep << "!" << endl;
-                    return;
+
+// ─── RESULT COLLECTION ───
+// Worker 2 (GCP) sends all its distances to Baadal via Redis
+if (worker_id == 2) {
+    cout << "Sending distance results to Baadal..." << endl;
+    
+    vector<string> result_strs;
+    vector<const char*> argv;
+    vector<size_t> argvlen;
+    
+    argv.push_back("LPUSH");
+    argvlen.push_back(5);
+    argv.push_back("result_queue");
+    argvlen.push_back(12);
+    
+    for (auto& pair : distances) {
+        if (pair.second != INF) {
+            result_strs.push_back(to_string(pair.first) + ":" + to_string(pair.second));
+        }
+    }
+    for (auto& msg : result_strs) {
+        argv.push_back(msg.c_str());
+        argvlen.push_back(msg.size());
+    }
+    redisReply* r = (redisReply*)redisCommandArgv(redis, argv.size(), argv.data(), argvlen.data());
+    if (r) freeReplyObject(r);
+    
+    // Signal that results are sent
+    redisCommand(redis, "SET result_ready 1");
+    cout << "Results sent!" << endl;
+}
+
+// Worker 1 (Baadal) waits for GCP results then merges and prints
+if (worker_id == 1) {
+    cout << "Waiting for GCP results..." << endl;
+    
+    // Wait for GCP to signal ready
+    while (true) {
+        redisReply* r = (redisReply*)redisCommand(redis, "GET result_ready");
+        if (r && r->str && atoi(r->str) == 1) {
+            freeReplyObject(r);
+            break;
+        }
+        if (r) freeReplyObject(r);
+        usleep(100000);
+    }
+    
+    // Fetch all GCP distances in one shot
+    redisReply* all_results = (redisReply*)redisCommand(redis, "LRANGE result_queue 0 -1");
+    
+    // Merge GCP distances into local distances map
+    if (all_results && all_results->type == REDIS_REPLY_ARRAY) {
+        for (size_t i = 0; i < all_results->elements; i++) {
+            if (!all_results->element[i]->str) continue;
+            string msg = all_results->element[i]->str;
+            int delim = msg.find(':');
+            if (delim == (int)string::npos) continue;
+            int node = stoi(msg.substr(0, delim));
+            int dist = stoi(msg.substr(delim + 1));
+            distances[node] = dist; // merge into Baadal's map
+        }
+        freeReplyObject(all_results);
+    }
+    
+    // ─── PRINT COMPLETE GLOBAL RESULTS ───
+    cout << "\n" << endl;
+    cout << "   COMPLETE GLOBAL BFS RESULTS" << endl;
+    cout << "   Source Node: " << source_vertex << endl;
+    cout << "\n" << endl;
+    
+    int reachable = 0, unreachable = 0, max_dist = 0;
+    map<int,int> dist_histogram; // distance → count of nodes
+    
+    for (auto& pair : distances) {
+        if (pair.second != INF) {
+            reachable++;
+            max_dist = max(max_dist, pair.second);
+            dist_histogram[pair.second]++;
+        } else {
+            unreachable++;
+        }
+    }
+    
+    cout << "Total vertices seen:          " << distances.size() << endl;
+    cout << "Reachable vertices:           " << reachable << endl;
+    cout << "Unreachable vertices:         " << unreachable << endl;
+    cout << "max depth:   " << max_dist << endl;
+    cout << "\nBFS Level Distribution:" << endl;
+    for (auto& pair : dist_histogram) {
+        cout << "  Distance " << pair.first << ": " << pair.second << " nodes" << endl;
+    }
+    
+    // Sample of 15 closest nodes
+    cout << "\nSample distances from source " << source_vertex << ":" << endl;
+    int count = 0;
+    for (auto& pair : distances) {
+        if (pair.second != INF && pair.second > 0 && count < 15) {
+            cout << "  Node " << pair.first << " → distance " << pair.second << endl;
+            count++;
+        }
+    }
+    cout << "\n" << endl;
+}
+return;
                 }
                 break;
             }
