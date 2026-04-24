@@ -73,7 +73,7 @@ echo -e "${GREEN}      Redis flushed!${NC}"
 
 # ── STEP 6: Start Worker 1 on Baadal in background first ──
 echo -e "${GREEN}      Starting Worker 1 on Baadal...${NC}"
-./worker 1 baadal_partition.txt &
+./worker 1 baadal_partition.txt $SPLIT &
 WORKER1_PID=$!
 
 # Wait for Worker 1 to flush Redis and register
@@ -82,7 +82,7 @@ sleep 5
 # ── STEP 7: Start Worker 2 on GCP ──
 echo -e "${GREEN}      Starting Worker 2 on GCP...${NC}"
 ssh -o StrictHostKeyChecking=no $GCP_USER@$GCP_IP \
-    "cd $PROJECT_DIR && nohup ./worker 2 gcp_partition.txt > /tmp/worker2.log 2>&1 &"
+    "cd $PROJECT_DIR && nohup ./worker 2 gcp_partition.txt $SPLIT > /tmp/worker2.log 2>&1 &"
 echo -e "${GREEN}      Worker 2 started!${NC}"
 
 # ── STEP 8: Wait for Worker 1 to finish ──
@@ -100,7 +100,27 @@ echo ""
 # Wait a moment for Worker 2 to finish writing log
 sleep 10
 ssh -o StrictHostKeyChecking=no $GCP_USER@$GCP_IP "cat /tmp/worker2.log"
-echo ""
 
+echo -e "${YELLOW}[5/5] Running Degree Centrality...${NC}"
+
+# Start degree worker 1 on Baadal first (it flushes Redis)
+./degree 1 baadal_partition.txt $SPLIT &
+DEGREE1_PID=$!
+
+sleep 2
+
+# Then start degree worker 2 on GCP
+ssh -o StrictHostKeyChecking=no $GCP_USER@$GCP_IP \
+    "cd $PROJECT_DIR && nohup ./degree 2 gcp_partition.txt $SPLIT > /tmp/degree2.log 2>&1 &"
+
+# Wait for worker 1 to finish
+wait $DEGREE1_PID
+
+# Show GCP degree output
+sleep 5
 echo ""
-echo -e "${GREEN} Hybrid BFS Pipeline Complete!${NC}"
+echo "   WORKER 2 (GCP) DEGREE OUTPUT:"
+echo ""
+ssh -o StrictHostKeyChecking=no $GCP_USER@$GCP_IP "cat /tmp/degree2.log"
+
+echo -e "${GREEN} Hybrid Pipeline Complete!${NC}"

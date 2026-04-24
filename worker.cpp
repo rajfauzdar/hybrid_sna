@@ -13,7 +13,7 @@ using namespace std;
 // --- Global State ---
 unordered_map<int, vector<int>> adj_list;
 unordered_map<int, int> distances;
-const int BAADAL_PERCENTAGE = 70; 
+int BAADAL_PERCENTAGE;
 const int INF = 99999999;
 
 // Worker Config
@@ -299,10 +299,11 @@ return;
 
 int main(int argc, char* argv[]) {
     // Requires Worker ID and Partition File
-    if (argc != 3) {
-        cerr << "Usage: ./worker <worker_id_1_or_2> <partition_file.txt>" << endl;
-        return 1;
-    }
+    if (argc != 4) {
+    cerr << "Usage: ./worker <worker_id> <partition_file> <baadal_percentage>" << endl;
+    return 1;
+}
+    BAADAL_PERCENTAGE = atoi(argv[3]);
 
     worker_id = stoi(argv[1]);
     

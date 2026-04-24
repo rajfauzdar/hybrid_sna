@@ -10,11 +10,15 @@
 using namespace std;
 
 int worker_id;
+int BAADAL_PERCENTAGE;
 string my_queue, other_queue;
 unordered_map<int, int> local_degree; // node -> degree count
 
 bool is_local(int node) {
-    return (node % 2 == worker_id - 1);
+    unsigned int mixed_hash = (unsigned int)node * 2654435761;
+    int hash_val = mixed_hash % 100;
+    if (worker_id == 1) return hash_val < BAADAL_PERCENTAGE;
+    else                return hash_val >= BAADAL_PERCENTAGE;
 }
 
 void load_partition(const string& filename) {
@@ -29,11 +33,11 @@ void load_partition(const string& filename) {
 }
 
 int main(int argc, char* argv[]) {
-    if (argc < 3) {
-        cerr << "Usage: ./degree <worker_id> <partition_file>" << endl;
+    if (argc < 4) {
+        cerr << "Usage: ./degree <worker_id> <partition_file> <baadal_percentage>" << endl;
         return 1;
     }
-
+    BAADAL_PERCENTAGE = atoi(argv[3]);
     worker_id = atoi(argv[1]);
     string partition_file = argv[2];
 
